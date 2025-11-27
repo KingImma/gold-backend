@@ -68,11 +68,15 @@ class TwelveDataAdapter(BrokerAdapter):
             print(f"✗ Connection error: {e}")
             return False
 
-    def fetch_ticker(self, symbol: str = "XAU/USD") -> Dict:
+    def fetch_ticker(self, symbol: str = "XAUUSD") -> Dict:
         """Get current gold price in real-time"""
         try:
+            print("debug: symbol", symbol)
             response = self.session.get(
-                f"{self.BASE_URL}/quote", params={"symbol": symbol}
+                f"{self.BASE_URL}/quote", params={
+                    "symbol": symbol,
+                    "apikey":self.api_key
+                    }
             )
             data = response.json()
 
@@ -164,7 +168,7 @@ class AlphaVantageAdapter(BrokerAdapter):
             print(f"✗ Connection error: {e}")
             return False
 
-    def fetch_ticker(self, symbol: str = "XAU") -> Dict:
+    def fetch_ticker(self, symbol: str = "XAUUSD") -> Dict:
         try:
             params = {
                 "function": "CURRENCY_EXCHANGE_RATE",
@@ -180,7 +184,7 @@ class AlphaVantageAdapter(BrokerAdapter):
 
             rate = data["Realtime Currency Exchange Rate"]
             return {
-                "symbol": f"{symbol}/USD",
+                "symbol": f"{symbol}",
                 "price": float(rate["5. Exchange Rate"]),
                 "timestamp": int(time.time() * 1000),
             }

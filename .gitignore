@@ -1,0 +1,27 @@
+.env
+goldbot-33101-firebase-adminsdk-fbsvc-d6ef46e273.json
+venv/
+__pycache__/
+*.pyc
+# Virtual env
+venv/
+.env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE stuff
+.vscode/
+.idea/
+
+# Environment files
+.env
+*.env
+
+# OS garbage
+.DS_Store
+Thumbs.db

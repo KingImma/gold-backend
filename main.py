@@ -4,17 +4,66 @@ import time
 from typing import Optional, List, Dict
 
 import pandas as pd
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from contextlib import  asynccontextmanager
+from dotenv import load_dotenv
 
 from broker_adapter import TwelveDataAdapter
 from realtime_feed import RealtimeFeed, PriceMonitor
 from historical_storage import HistoricalDataStore
 import config
 
+load_dotenv()
+SYMBOLS = os.getenv("SYMBOLS")
+TWELVEDATAKEY = os.getenv("TWELVE_DATA_API_KEY")
+DB_URL = os.getenv("DATABASE_PATH")
+HISTORICAL_LIM = os.getenv("HISTORICAL_LIMIT")
+REALTIME_INT = os.getenv("REALTIME_INTERVAL")
+DEFAULT_INT = os.getenv("DEFAULT_INTERVAL")
+ALPHAKEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-app = FastAPI(title="Gold Trading Bot API", version="1.0.0")
+@asynccontextmanager
+async def startup(app: FastAPI):
+    global broker, storage, feed, monitor
+
+    print("=" * 60)
+    print("Gold Trading Bot - API Server")
+    print("=" * 60)
+
+    print("\n[1/4] Connecting to broker API...")
+    broker = TwelveDataAdapter(TWELVEDATAKEY)
+    if not broker.connect():
+        raise RuntimeError("Failed to connect to Twelve Data API")
+
+    print("\n[2/4] Initializing database...")
+    storage = HistoricalDataStore(DB_URL)
+
+    print("\n[3/4] Initial historical sync...")
+    for symbol in config.SYMBOLS:
+        storage.update_from_broker(
+            broker, symbol, DEFAULT_INT, HISTORICAL_LIM
+        )
+
+    print("\n[4/4] Starting realtime feed...")
+    feed = RealtimeFeed(broker, SYMBOLS, interval=REALTIME_INT)
+    monitor = PriceMonitor(feed)
+    feed.start()
+
+    t = threading.Thread(target=_db_update_loop, daemon=True)
+    t.start()
+
+    print("\n✓ Startup complete. API ready.")
+
+    yield 
+
+    print("Shutting down realtime feed...")
+    feed.stop()
+
+
+app = FastAPI(title="Gold Trading Bot API", version="1.0.0", lifespan=startup)
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,46 +102,14 @@ def _db_update_loop():
     while True:
         try:
             if broker is not None and storage is not None:
-                for symbol in config.SYMBOLS:
+                for symbol in SYMBOLS:
                     storage.update_from_broker(
-                        broker, symbol, config.DEFAULT_INTERVAL, limit=10
+                        broker, symbol, DEFAULT_INT, limit=10
                     )
         except Exception as e:
             print(f"⚠ DB update error: {e}")
         time.sleep(300)
 
-
-@app.on_event("startup")
-def startup():
-    global broker, storage, feed, monitor
-
-    print("=" * 60)
-    print("Gold Trading Bot - API Server")
-    print("=" * 60)
-
-    print("\n[1/4] Connecting to broker API...")
-    broker = TwelveDataAdapter(config.TWELVE_DATA_API_KEY)
-    if not broker.connect():
-        raise RuntimeError("Failed to connect to Twelve Data API")
-
-    print("\n[2/4] Initializing database...")
-    storage = HistoricalDataStore(config.DATABASE_PATH)
-
-    print("\n[3/4] Initial historical sync...")
-    for symbol in config.SYMBOLS:
-        storage.update_from_broker(
-            broker, symbol, config.DEFAULT_INTERVAL, config.HISTORICAL_LIMIT
-        )
-
-    print("\n[4/4] Starting realtime feed...")
-    feed = RealtimeFeed(broker, config.SYMBOLS, interval=config.REALTIME_INTERVAL)
-    monitor = PriceMonitor(feed)
-    feed.start()
-
-    t = threading.Thread(target=_db_update_loop, daemon=True)
-    t.start()
-
-    print("\n✓ Startup complete. API ready.")
 
 
 @app.get("/api/ticker", response_model=TickerResponse)
@@ -122,8 +139,8 @@ def get_ohlcv(limit: int = 200):
     if storage is None:
         raise RuntimeError("Storage not initialized")
 
-    symbol = config.SYMBOLS[0]
-    interval = config.DEFAULT_INTERVAL
+    symbol = SYMBOLS[0]
+    interval = DEFAULT_INT
     df = storage.fetch_ohlcv(symbol, interval)
     if df is None or df.empty:
         return []
