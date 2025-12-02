@@ -1,0 +1,27 @@
+{
+    "trading": {
+        "symbols": ["XAU/USD"],
+        "default_interval": "1h",
+        "risk_level": "CONSERVATIVE",
+        "max_positions": 1
+    },
+    "strategies": {
+        "ema_cross": {
+            "enabled": true,
+            "fast_period": 20,
+            "slow_perios": 50
+        },
+        "rsi": {
+            "enabled": true,
+            "fast_period": 70,
+            "slow_period": 30
+        }
+    },
+    "risk_management": {
+    "stop_loss_pct": 0.02,
+    "take_profit_ratio": 2.0,
+    "trailing_stop_enabled": true,
+    "max_drawdown_pct": 0.10,
+    "daily_loss_limit": 500
+  }
+}
