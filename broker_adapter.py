@@ -71,7 +71,6 @@ class TwelveDataAdapter(BrokerAdapter):
     def fetch_ticker(self, symbol: str = "XAUUSD") -> Dict:
         """Get current gold price in real-time"""
         try:
-            print("debug: symbol", symbol)
             response = self.session.get(
                 f"{self.BASE_URL}/quote", params={
                     "symbol": symbol,

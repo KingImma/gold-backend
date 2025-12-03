@@ -5,16 +5,18 @@ from typing import Optional, List, Dict
 
 import pandas as pd
 import os
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from firebase_admin import auth
 
 from broker_adapter import TwelveDataAdapter
 from realtime_feed import RealtimeFeed, PriceMonitor
 from historical_storage import HistoricalDataStore
 from strategy import EmaCross, RsiStrategy 
+from auth import verify_firebase_token
 import config
 
 load_dotenv()
@@ -110,6 +112,11 @@ class Candle(BaseModel):
     low: float
     close: float
     volume: float
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: str | None = None
 
 
 def _db_update_loop():
@@ -211,6 +218,33 @@ def get_ohlcv(limit: int = 200):
         )
     return candles
 
+@app.post("/api/signup")
+def signup(user: SignupRequest):
+    try:
+        firebase_user = auth.create_user(
+            email= user.email,
+            password= user.password,
+            display_name = user.display_name
+        )
+        custom_token = auth.create_custom_token(firebase_user.uid)
+        return{
+            "uid": firebase_user.uid,
+            "email": firebase_user.email,
+            "token": custom_token.decode("utf-8"),
+            "message": "User created successfully"
+        }
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="Email already exists")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/profile")
+async def profile(user=Depends(verify_firebase_token)):
+    return{
+        "uid": user["uid"],
+        "email": user.get("email"),
+        "provider": user.get("firebase", {}).get("sign_in_provider")
+    }
 
 @app.get("/api/signals")
 def get_signals():
