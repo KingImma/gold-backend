@@ -5,6 +5,7 @@ from typing import Optional, List, Dict
 
 import pandas as pd
 import os
+import requests
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -22,6 +23,8 @@ import config
 load_dotenv()
 
 # Configuration
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+FIREBASE_LOGIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
 SYMBOLS = config.SYMBOLS
 TWELVEDATAKEY = os.getenv("TWELVE_DATA_API_KEY", config.TWELVE_DATA_API_KEY)
 DB_URL = os.getenv("DATABASE_PATH", config.DATABASE_PATH)
@@ -113,10 +116,14 @@ class Candle(BaseModel):
     close: float
     volume: float
 
-class SignupRequest(BaseModel):
+class AuthRequest(BaseModel):
     email: EmailStr
     password: str
     display_name: str | None = None
+
+
+class TokenLogin(BaseModel):
+    id_token: str
 
 
 def _db_update_loop():
@@ -218,8 +225,9 @@ def get_ohlcv(limit: int = 200):
         )
     return candles
 
+
 @app.post("/api/signup")
-def signup(user: SignupRequest):
+def signup(user: AuthRequest):
     try:
         firebase_user = auth.create_user(
             email= user.email,
@@ -237,6 +245,48 @@ def signup(user: SignupRequest):
         raise HTTPException(status_code=400, detail="Email already exists")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+
+@app.post("/api/login1")
+def login(user: AuthRequest):
+        payload = {
+            "email": user.email,
+            "password": user.password,
+            "display_name": user.display_name,
+            "returnSecureToken": True
+        }
+
+        response = requests.post(FIREBASE_LOGIN_URL, json=payload)
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password"
+            )
+        result = response.json()
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"]["message"])
+        return {
+            "id_token": result["idToken"],
+            "refresh_token": result["refreshToken"],
+            "expires_in": result["expiresIn"],
+            "email": result.get("email"),
+            "display_name": result.get("dislpay_name"),
+            "local_id": result.get("localId")
+        }
+
+@app.post("/api/login2")
+def login_user(data: TokenLogin):
+    try:
+        decoded = auth.verify_id_token(data.id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired Firebase Token")
+    
+    return {
+        "uid": decoded["uid"],
+        "email": decoded.get("email"),
+        "name": decoded.get("name"),
+        "provider": decoded.get("firebase", {}).get("sign_in_provider")
+    }
 
 @app.get("/api/profile")
 async def profile(user=Depends(verify_firebase_token)):
