@@ -1,4 +1,5 @@
 # backend/main.py
+# backend/main.py
 import threading
 import time
 from typing import Optional, List, Dict
@@ -14,6 +15,8 @@ from dotenv import load_dotenv
 from firebase_admin import auth
 
 from broker_adapter import TwelveDataAdapter
+from models import Order, OrderType, Side
+from execution import PaperBroker , ExecutionBroker  # contains ExecutionBroker class
 from realtime_feed import RealtimeFeed, PriceMonitor
 from historical_storage import HistoricalDataStore
 from strategy import EmaCross, RsiStrategy 
@@ -42,9 +45,16 @@ async def startup(app: FastAPI):
     print("=" * 60)
 
     print("\n[1/4] Connecting to broker API...")
-    broker = TwelveDataAdapter(TWELVEDATAKEY)
-    if not broker.connect():
-        raise RuntimeError("Failed to connect to Twelve Data API")
+    # Initialize paper broker
+    paper_broker = PaperBroker(cash=100000.0, fee_rate=0.001, slippage_pct=0.0005)
+
+    # Initialize live broker adapter
+    adapter = TwelveDataAdapter(TWELVEDATAKEY)
+
+    # Initialize execution broker (paper + live)
+    broker = ExecutionBroker(paper_broker=paper_broker, adapter=adapter)
+    if not broker.connected:
+        print("⚠ Warning: Falling back to paper trading only")
 
     print("\n[2/4] Initializing database...")
     storage = HistoricalDataStore(DB_URL)
@@ -89,7 +99,7 @@ app.add_middleware(
 )
 
 # Global state variables
-broker: Optional[TwelveDataAdapter] = None
+broker: Optional[ExecutionBroker] = None
 storage: Optional[HistoricalDataStore] = None
 feed: Optional[RealtimeFeed] = None
 monitor: Optional[PriceMonitor] = None
@@ -125,11 +135,26 @@ class AuthRequest(BaseModel):
 class TokenLogin(BaseModel):
     id_token: str
 
+class OrderRequest(BaseModel):
+    symbol: str
+    side: str
+    qty: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
 
 def _db_update_loop():
-    """Background thread that updates database and evaluates strategies"""
+    """Background thread: updates database, evaluates strategies, and executes trades with risk management"""
     global broker, storage, strategy, rsi_strategy, last_bar_ts_map, last_signals
     
+    # Default trade settings
+    DEFAULT_TRADE_QTY = 1.0
+    DEFAULT_STOP_LOSS_PCT = 0.01  # 1% stop loss
+    DEFAULT_TAKE_PROFIT_PCT = 0.02  # 2% take profit
+
+    # Initialize risk manager (customize as needed)
+    risk_manager = RiskManager(max_position_size=5.0, max_exposure_pct=0.05)
+
     while True:
         try:
             if broker is not None and storage is not None:
@@ -137,42 +162,86 @@ def _db_update_loop():
                     stored = storage.update_from_broker(
                         broker, symbol, DEFAULT_INT, limit=10
                     )
-                    # Evaluate strategies on new bars
-                    if stored and strategy is not None and rsi_strategy is not None:
-                        df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
-                        if df is not None and not df.empty:
-                            last_ts = int(df.index[-1].timestamp() * 1000)
-                            if last_bar_ts_map.get(symbol) != last_ts:
-                                last_bar_ts_map[symbol] = last_ts
+                    if not stored:
+                        continue
 
-                                print(f"\n📊 Evaluating new candle at {last_ts}")
-                                print(f"   Close: ${df['close'].iloc[-1]:.2f}")
-                                
-                                ema_sigs = strategy.on_bar(df.tail(200))
-                                rsi_sigs = rsi_strategy.on_bar(df.tail(200))
+                    df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
+                    if df is None or df.empty:
+                        continue
 
-                                if not ema_sigs and not rsi_sigs:
-                                    print(f"   ℹ️ No signals - conditions not met")
-                                
-                                all_signals = ema_sigs + rsi_sigs
-                                
-                                if all_signals:
-                                    print(f"\n🚨 SIGNALS DETECTED at {last_ts}:")
-                                    for s in all_signals:
-                                        print(f"  → {s.side.value} {s.symbol} (confidence: {getattr(s, 'confidence', 1.0)})")
-                                
-                                last_signals = [
-                                    {
-                                        "symbol": s.symbol,
-                                        "side": s.side.value,
-                                        "confidence": getattr(s, "confidence", 1.0),
-                                        "ts": last_ts,
-                                    }
-                                    for s in all_signals
-                                ]
+                    last_ts = int(df.index[-1].timestamp() * 1000)
+                    if last_bar_ts_map.get(symbol) == last_ts:
+                        continue
+                    last_bar_ts_map[symbol] = last_ts
+
+                    print(f"\n📊 Evaluating new candle for {symbol} at {last_ts}")
+                    print(f"   Close: ${df['close'].iloc[-1]:.2f}")
+
+                    # Get signals
+                    ema_sigs = strategy.on_bar(df.tail(200)) if strategy else []
+                    rsi_sigs = rsi_strategy.on_bar(df.tail(200)) if rsi_strategy else []
+                    all_signals = ema_sigs + rsi_sigs
+
+                    if not all_signals:
+                        print("   ℹ️ No signals - conditions not met")
+                        continue
+
+                    for sig in all_signals:
+                        side = sig.side
+                        price = df['close'].iloc[-1]
+                        qty = getattr(sig, "qty", DEFAULT_TRADE_QTY)
+
+                        # Risk check: allow trade only if RiskManager permits
+                        if not risk_manager.can_enter_trade(symbol, side, qty, price):
+                            print(f"  ⚠ Trade skipped due to risk limits: {side.value} {symbol} | Qty: {qty}")
+                            continue
+
+                        # Calculate stop loss / take profit
+                        if side == Side.BUY:
+                            stop_loss = price * (1 - DEFAULT_STOP_LOSS_PCT)
+                            take_profit = price * (1 + DEFAULT_TAKE_PROFIT_PCT)
+                        else:
+                            stop_loss = price * (1 + DEFAULT_STOP_LOSS_PCT)
+                            take_profit = price * (1 - DEFAULT_TAKE_PROFIT_PCT)
+
+                        order = Order(
+                            symbol=sig.symbol,
+                            side=side,
+                            qty=qty,
+                            price=None,  # market order
+                            order_type=OrderType.MARKET,
+                            ts=int(time.time() * 1000)
+                        )
+
+                        trade = broker.submit_order(
+                            order,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit
+                        )
+
+                        # Update trailing stops if enabled
+                        if risk_manager.trailing_stop_enabled:
+                            broker.update_trailing_stops({symbol: price}, risk_manager)
+
+                        print(f"  🚀 Executed {side.value} order: {trade.symbol} | Qty: {trade.qty} | Price: {trade.price:.2f} | SL: {stop_loss:.2f} | TP: {take_profit:.2f}")
+
+                    # Save last signals for API
+                    last_signals[:] = [
+                        {
+                            "symbol": s.symbol,
+                            "side": s.side.value,
+                            "confidence": getattr(s, "confidence", 1.0),
+                            "ts": last_ts,
+                        }
+                        for s in all_signals
+                    ]
+
         except Exception as e:
             print(f"⚠ DB update error: {e}")
+
         time.sleep(300)  # Check every 5 minutes
+
+
 
 
 @app.get("/api/ticker", response_model=TickerResponse)
@@ -302,6 +371,31 @@ def get_signals():
     global last_signals
     return last_signals or []
 
+@app.post("/api/order")
+def place_order(req: OrderRequest):
+    global broker
+    if broker is None:
+        raise RuntimeError("Broker not initialized")
+
+    side = Side.BUY if req.side.upper() == "BUY" else Side.SELL
+    order = Order(
+        symbol=req.symbol,
+        side=side,
+        qty=req.qty,
+        price=None,  # use current market price
+        order_type=OrderType.MARKET,
+        ts=int(time.time() * 1000)
+    )
+
+    trade = broker.submit_order(order, stop_loss=req.stop_loss, take_profit=req.take_profit)
+    return {
+        "symbol": trade.symbol,
+        "side": trade.side.value,
+        "qty": trade.qty,
+        "price": trade.price,
+        "fee": trade.fee,
+        "timestamp": trade.ts
+    }
 
 if __name__ == "__main__":
     import uvicorn
