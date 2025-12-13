@@ -16,6 +16,7 @@ from firebase_admin import auth
 from broker_adapter import TwelveDataAdapter
 from execution import PaperBroker, ExecutionBroker
 from historical_storage import HistoricalDataStore
+from models import Order, OrderType
 from strategy import EmaCross, RsiStrategy 
 from risk import RiskManager
 from auth import verify_firebase_token
@@ -109,64 +110,96 @@ app.add_middleware(
 # Background loop
 # =========================
 def _db_update_loop():
-    """Background thread: update DB, evaluate signals, place trades"""
-    global market_broker, execution_broker, storage, strategy, rsi_strategy, last_bar_ts_map, last_signals, risk_manager
-    
+    """Background thread: updates DB, evaluates strategies, checks risk, executes trades"""
+    global execution_broker, storage, strategy, rsi_strategy, last_bar_ts_map, last_signals
+
+    # Initialize risk manager (adjust params as needed)
+    risk_manager = RiskManager()
+
     while True:
         try:
-            for symbol in SYMBOLS:
-                # 1️⃣ Update historical bars
-                storage.update_from_broker(market_broker, symbol, DEFAULT_INT, limit=10)
-                
-                df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
-                if df is None or df.empty:
-                    continue
-                
-                last_ts = int(df.index[-1].timestamp() * 1000)
-                if last_bar_ts_map.get(symbol) == last_ts:
-                    continue
-                
-                last_bar_ts_map[symbol] = last_ts
-                print(f"\n📊 New candle at {last_ts} | Close: ${df['close'].iloc[-1]:.2f}")
-                
-                # 2️⃣ Evaluate strategies
-                ema_signals = strategy.on_bar(df.tail(200))
-                rsi_signals = rsi_strategy.on_bar(df.tail(200))
-                all_signals = ema_signals + rsi_signals
-                
-                if all_signals:
-                    print(f"🚨 Signals detected for {symbol}:")
-                    for s in all_signals:
-                        print(f"  → {s.side.value} {s.symbol} (confidence={getattr(s,'confidence',1.0)})")
-                    
-                    # 3️⃣ Place trades if allowed by risk manager
-                    for signal in all_signals:
-                        if not risk_manager.is_trade_allowed(symbol, signal.side):
-                            print(f"⚠ Trade blocked by risk manager: {signal.side.value} {symbol}")
-                            continue
-                        
-                        # Use last close price for market execution
-                        last_price = df['close'].iloc[-1]
-                        trade = execution_broker.submit_order(
-                            order_signal=signal,
-                            stop_loss=None,  # optionally configure
-                            take_profit=None
-                        )
-                        print(f"✅ Trade executed: {trade.side.value} {trade.symbol} qty={trade.qty} at ${trade.price}")
-                
-                last_signals = [
-                    {
-                        "symbol": s.symbol,
-                        "side": s.side.value,
-                        "confidence": getattr(s, "confidence", 1.0),
-                        "ts": last_ts
-                    } for s in all_signals
-                ]
+            if execution_broker is not None and storage is not None:
+                for symbol in SYMBOLS:
+                    # Update historical data
+                    stored = storage.update_from_broker(
+                        execution_broker.adapter, symbol, DEFAULT_INT, limit=10
+                    )
+
+                    if stored and strategy is not None and rsi_strategy is not None:
+                        df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
+                        if df is not None and not df.empty:
+                            last_ts = int(df.index[-1].timestamp() * 1000)
+                            if last_bar_ts_map.get(symbol) != last_ts:
+                                last_bar_ts_map[symbol] = last_ts
+
+                                print(f"\n📊 New candle at {last_ts} | Close: ${df['close'].iloc[-1]:.2f}")
+
+                                # Generate signals
+                                ema_sigs = strategy.on_bar(df.tail(200))
+                                rsi_sigs = rsi_strategy.on_bar(df.tail(200))
+                                all_signals = ema_sigs + rsi_sigs
+
+                                last_signals = [
+                                    {
+                                        "symbol": s.symbol,
+                                        "side": s.side.value,
+                                        "confidence": getattr(s, "confidence", 1.0),
+                                        "ts": last_ts,
+                                    }
+                                    for s in all_signals
+                                ]
+
+                                if not all_signals:
+                                    print("   ℹ️ No trading signals")
+                                    continue
+
+                                print(f"\n🚨 Signals detected for {symbol}:")
+                                for s in all_signals:
+                                    print(f"  → {s.side.value} {s.symbol} (confidence: {getattr(s,'confidence',1.0)})")
+
+                                # Execute trades with risk checks
+                                for s in all_signals:
+                                    # Determine trade size
+                                    current_price = execution_broker.get_price(s.symbol)
+                                    position_size = risk_manager.calc_position_size(
+                                        symbol=s.symbol,
+                                        price=current_price,
+                                        confidence=getattr(s, "confidence", 1.0)
+                                    )
+
+                                    # Check exposure
+                                    if not risk_manager.check_exposure(symbol=s.symbol, trade_value=position_size * current_price):
+                                        print(f"   ⚠ Trade skipped due to risk limits for {s.symbol}")
+                                        continue
+
+                                    # Create order
+                                    order_side = s.side
+                                    order = Order(
+                                        symbol=s.symbol,
+                                        side=order_side,
+                                        qty=position_size,
+                                        order_type=OrderType.MARKET,
+                                        price=current_price,
+                                        ts=last_ts
+                                    )
+
+                                    # Optional: set stop loss / take profit
+                                    stop_loss = None
+                                    take_profit = None
+                                    if hasattr(s, "stop_loss"):
+                                        stop_loss = s.stop_loss
+                                    if hasattr(s, "take_profit"):
+                                        take_profit = s.take_profit
+
+                                    # Submit trade
+                                    trade = execution_broker.submit_order(order, stop_loss, take_profit)
+                                    print(f"   ✅ Executed {trade.side.value} {trade.symbol} @ {trade.price} | Qty: {trade.qty}")
 
         except Exception as e:
-            print(f"⚠ DB update error: {e}")
-        
-        time.sleep(300)  # 5 min interval
+            print(f"⚠ DB update loop error: {e}")
+
+        time.sleep(300)  # every 5 min
+
 
 # =========================
 # FastAPI Endpoints
