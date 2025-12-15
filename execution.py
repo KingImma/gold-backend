@@ -15,7 +15,7 @@ class PaperBroker:
     """
 
     def __init__(
-        self, 
+        self,
         cash: float = 100000.0,
         fee_rate: float = 0.001,
         slippage_pct: float = 0.0005,
@@ -35,7 +35,6 @@ class PaperBroker:
         self.peak_equity = cash
         self.max_drawdown = 0.0
         self.total_fees_paid = 0.0
-
     def set_stop_loss(self, symbol: str, stop_price: float):
         self.stop_losses[symbol] = stop_price
 
@@ -217,9 +216,15 @@ class PaperBroker:
 # ===========================
 # Broker Adapter Integration
 # ===========================
+# ===========================
+# Broker Adapter Integration
+# ===========================
 class BrokerAdapter(ABC):
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    """
+    Base interface for live broker adapters (OANDA, FXCM, etc.).
+    """
+
+    def __init__(self):
         self.connected = False
 
     @abstractmethod
@@ -233,6 +238,7 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def fetch_ohlcv(self, symbol: str, interval: str, limit: int) -> List[List]:
         pass
+
 
 
 class ExecutionBroker:
@@ -249,19 +255,28 @@ class ExecutionBroker:
         data = self.adapter.fetch_ticker(symbol)
         return data["price"]
 
-    def submit_order(self, order: Order, stop_loss: Optional[float] = None, take_profit: Optional[float] = None) -> Trade:
+    def submit_order(
+        self,
+        order: Order,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None
+    ) -> Trade:
         """
-        Submit order: executes live via adapter or simulates with PaperBroker
+        Submit order: executes live via adapter or simulates with PaperBroker.
+        Currently only simulates; hook for real execution is marked below.
         """
         if not self.connected:
-            # fallback to paper trading
             return self.paper.submit(order, stop_loss, take_profit)
 
-        # For live, use adapter price if not provided
         if not order.price:
             order.price = self.get_price(order.symbol)
+
+        # Simulated fill in PaperBroker (used also as back-office for PnL)
         trade = self.paper.submit(order, stop_loss, take_profit)
-        # TODO: here you can call adapter-specific execution API if supported
+
+        # TODO: call adapter.place_order(...) when you are ready for real fills
+        # e.g. self.adapter.place_order(...)
+
         return trade
 
     def close_position(self, symbol: str):

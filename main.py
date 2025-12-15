@@ -13,77 +13,92 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from firebase_admin import auth
 
-from broker_adapter import TwelveDataAdapter
-from execution import PaperBroker, ExecutionBroker
+from broker_adapter import TwelveDataAdapter, FxcmAdapter
+from execution import ExecutionBroker, PaperBroker
 from historical_storage import HistoricalDataStore
 from models import Order, OrderType
-from strategy import EmaCross, RsiStrategy 
+from strategy import EmaCross, RsiStrategy
 from risk import RiskManager
 from auth import verify_firebase_token
 import config
+from strategy_engine import StrategyEngine  # <-- new import
 
 load_dotenv()
 
+# =========================
 # Configuration
+# =========================
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 FIREBASE_LOGIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
 SYMBOLS = config.SYMBOLS
 TWELVEDATAKEY = os.getenv("TWELVE_DATA_API_KEY", config.TWELVE_DATA_API_KEY)
+
+FXCM_TOKEN = os.getenv("FXCM_API_TOKEN", getattr(config, "FXCM_API_TOKEN", ""))
+FXCM_SERVER = os.getenv("FXCM_SERVER", "demo")  # 'demo' or 'real'
+
 DB_URL = os.getenv("DATABASE_PATH", config.DATABASE_PATH)
 HISTORICAL_LIM = config.HISTORICAL_LIMIT
 REALTIME_INT = config.REALTIME_INTERVAL
 DEFAULT_INT = config.DEFAULT_INTERVAL
 
-# Global state variables
+# =========================
+# Global state
+# =========================
 market_broker: Optional[TwelveDataAdapter] = None
 execution_broker: Optional[ExecutionBroker] = None
 storage: Optional[HistoricalDataStore] = None
-strategy: Optional[EmaCross] = None
-rsi_strategy: Optional[RsiStrategy] = None
+strategy_engine: Optional[StrategyEngine] = None
 last_bar_ts_map: Dict[str, int] = {}
 last_signals: List[Dict] = []
 risk_manager: Optional[RiskManager] = None
 
 # =========================
-# FastAPI app with startup
+# FastAPI startup
 # =========================
 @asynccontextmanager
 async def startup(app: FastAPI):
-    global market_broker, execution_broker, storage, strategy, rsi_strategy, risk_manager
+    global market_broker, execution_broker, storage, strategy_engine, risk_manager
 
     print("=" * 60)
-    print("Gold Trading Bot - API Server")
+    print("Gold Trading Bot - API Server (FXCM Live Trading)")
     print("=" * 60)
 
-    # 1️⃣ Market Broker (Price fetching)
-    print("\n[1/4] Connecting to market broker API...")
+    # 1️⃣ Market Broker (historical/real-time prices)
+    print("\n[1/4] Connecting to market data broker...")
     market_broker = TwelveDataAdapter(TWELVEDATAKEY)
     if not market_broker.connect():
         raise RuntimeError("Failed to connect to Twelve Data API")
 
-    # 2️⃣ Execution Broker
-    print("\n[2/4] Initializing execution broker...")
-    paper_broker = PaperBroker(cash=100000.0, fee_rate=0.001)
+    # 2️⃣ Execution Broker (FXCM)
+    print("\n[2/4] Connecting to FXCM live trading...")
+    fxcm_adapter = FxcmAdapter(access_token=FXCM_TOKEN, server=FXCM_SERVER)
+    if not fxcm_adapter.connect():
+        raise RuntimeError("Failed to connect to FXCM API")
 
-# Use your TwelveDataAdapter as the broker adapter
-    adapter = TwelveDataAdapter(TWELVEDATAKEY)
+    # Paper broker for accounting + PnL tracking
+    paper_broker = PaperBroker()
+    execution_broker = ExecutionBroker(paper_broker=paper_broker, adapter=fxcm_adapter)
 
-# Now initialize ExecutionBroker properly
-    execution_broker = ExecutionBroker(paper_broker=PaperBroker, adapter=adapter)
-    
-    # 3️⃣ Risk Manager
+    # 3️⃣ Risk manager
     print("\n[3/4] Initializing risk manager...")
-    risk_manager = RiskManager()  # configure limits if needed here
+    risk_manager = RiskManager()
 
     # 4️⃣ Database
-    print("\n[4/4] Initializing database...")
+    print("\n[4/4] Initializing historical database...")
     storage = HistoricalDataStore(DB_URL)
     for symbol in SYMBOLS:
         storage.update_from_broker(market_broker, symbol, DEFAULT_INT, HISTORICAL_LIM)
 
-    # Initialize strategies
-    strategy = EmaCross(symbol=SYMBOLS[0], fast=20, slow=50)
-    rsi_strategy = RsiStrategy(symbol=SYMBOLS[0])
+    # Strategy engine for the main symbol
+    global strategy_engine
+    strategy_engine = StrategyEngine(
+        symbol=SYMBOLS[0],
+        storage=storage,
+        execution_broker=execution_broker,
+        risk_manager=risk_manager,
+        interval=DEFAULT_INT,
+        min_confidence=0.6,
+    )
 
     # Start background update loop
     t = threading.Thread(target=_db_update_loop, daemon=True)
@@ -93,113 +108,67 @@ async def startup(app: FastAPI):
     yield
     print("Shutting down...")
 
-# =========================
-# FastAPI App
-# =========================
 app = FastAPI(title="Gold Trading Bot API", version="1.0.0", lifespan=startup)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================
-# Background loop
+# Background update loop
 # =========================
 def _db_update_loop():
-    """Background thread: updates DB, evaluates strategies, checks risk, executes trades"""
-    global execution_broker, storage, strategy, rsi_strategy, last_bar_ts_map, last_signals
-
-    # Initialize risk manager (adjust params as needed)
-    risk_manager = RiskManager()
+    global execution_broker, storage, strategy_engine, last_bar_ts_map, last_signals, risk_manager
 
     while True:
         try:
-            if execution_broker is not None and storage is not None:
+            if execution_broker is not None and storage is not None and strategy_engine is not None:
                 for symbol in SYMBOLS:
-                    # Update historical data
+                    # 1) Update local DB from market data broker
                     stored = storage.update_from_broker(
-                        execution_broker.adapter, symbol, DEFAULT_INT, limit=10
+                        market_broker, symbol, DEFAULT_INT, limit=10
                     )
 
-                    if stored and strategy is not None and rsi_strategy is not None:
-                        df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
-                        if df is not None and not df.empty:
-                            last_ts = int(df.index[-1].timestamp() * 1000)
-                            if last_bar_ts_map.get(symbol) != last_ts:
-                                last_bar_ts_map[symbol] = last_ts
+                    if not stored:
+                        continue
 
-                                print(f"\n📊 New candle at {last_ts} | Close: ${df['close'].iloc[-1]:.2f}")
+                    # 2) Fetch latest candles to detect new bar
+                    df = storage.fetch_ohlcv(symbol, DEFAULT_INT)
+                    if df is None or df.empty:
+                        continue
 
-                                # Generate signals
-                                ema_sigs = strategy.on_bar(df.tail(200))
-                                rsi_sigs = rsi_strategy.on_bar(df.tail(200))
-                                all_signals = ema_sigs + rsi_sigs
+                    last_ts = int(df.index[-1].timestamp() * 1000)
+                    if last_bar_ts_map.get(symbol) == last_ts:
+                        continue
 
-                                last_signals = [
-                                    {
-                                        "symbol": s.symbol,
-                                        "side": s.side.value,
-                                        "confidence": getattr(s, "confidence", 1.0),
-                                        "ts": last_ts,
-                                    }
-                                    for s in all_signals
-                                ]
+                    last_bar_ts_map[symbol] = last_ts
+                    print(f"\n📊 New candle at {last_ts} | Close: ${df['close'].iloc[-1]:.2f}")
 
-                                if not all_signals:
-                                    print("   ℹ️ No trading signals")
-                                    continue
+                    # 3) Run strategy engine (multi-strategy + risk) and execute if allowed
+                    trade = strategy_engine.generate_and_execute()
 
-                                print(f"\n🚨 Signals detected for {symbol}:")
-                                for s in all_signals:
-                                    print(f"  → {s.side.value} {s.symbol} (confidence: {getattr(s,'confidence',1.0)})")
-
-                                # Execute trades with risk checks
-                                for s in all_signals:
-                                    # Determine trade size
-                                    current_price = execution_broker.get_price(s.symbol)
-                                    position_size = risk_manager.calc_position_size(
-                                        symbol=s.symbol,
-                                        price=current_price,
-                                        confidence=getattr(s, "confidence", 1.0)
-                                    )
-
-                                    # Check exposure
-                                    if not risk_manager.check_exposure(symbol=s.symbol, trade_value=position_size * current_price):
-                                        print(f"   ⚠ Trade skipped due to risk limits for {s.symbol}")
-                                        continue
-
-                                    # Create order
-                                    order_side = s.side
-                                    order = Order(
-                                        symbol=s.symbol,
-                                        side=order_side,
-                                        qty=position_size,
-                                        order_type=OrderType.MARKET,
-                                        price=current_price,
-                                        ts=last_ts
-                                    )
-
-                                    # Optional: set stop loss / take profit
-                                    stop_loss = None
-                                    take_profit = None
-                                    if hasattr(s, "stop_loss"):
-                                        stop_loss = s.stop_loss
-                                    if hasattr(s, "take_profit"):
-                                        take_profit = s.take_profit
-
-                                    # Submit trade
-                                    trade = execution_broker.submit_order(order, stop_loss, take_profit)
-                                    print(f"   ✅ Executed {trade.side.value} {trade.symbol} @ {trade.price} | Qty: {trade.qty}")
+                    # 4) Optionally track last_signals for /api/signals
+                    #    Here we just expose the last trade as a pseudo-signal
+                    if trade:
+                        last_signals = [
+                            {
+                                "symbol": trade.symbol,
+                                "side": trade.side.value,
+                                "confidence": 1.0,
+                                "ts": last_ts,
+                            }
+                        ]
+                    else:
+                        last_signals = []
 
         except Exception as e:
             print(f"⚠ DB update loop error: {e}")
 
         time.sleep(300)  # every 5 min
-
 
 # =========================
 # FastAPI Endpoints
@@ -207,8 +176,8 @@ def _db_update_loop():
 class TickerResponse(BaseModel):
     symbol: str
     price: float
-    change: float
-    change_percent: float
+    change: float = 0.0
+    change_percent: float = 0.0
     timestamp: int
     stats: Optional[Dict] = None
 
@@ -237,7 +206,7 @@ def get_ticker():
         change=last.get("change", 0.0),
         change_percent=last.get("change_percent", 0.0),
         timestamp=last["timestamp"],
-        stats=execution_broker.get_stats({last["symbol"]: last["price"]}),
+        stats=execution_broker.paper.get_stats({last["symbol"]: last["price"]}),
     )
 
 @app.get("/api/ohlcv", response_model=List[Candle])
@@ -245,7 +214,6 @@ def get_ohlcv(limit: int = 200):
     df = storage.fetch_ohlcv(SYMBOLS[0], DEFAULT_INT)
     if df is None or df.empty:
         return []
-    
     df = df.tail(limit)
     return [
         Candle(
@@ -264,7 +232,7 @@ def get_signals():
     return last_signals or []
 
 # =========================
-# Auth endpoints unchanged
+# Auth endpoints
 # =========================
 @app.post("/api/signup")
 def signup(user: AuthRequest):
@@ -275,7 +243,7 @@ def signup(user: AuthRequest):
             display_name=user.display_name
         )
         custom_token = auth.create_custom_token(firebase_user.uid)
-        return{
+        return {
             "uid": firebase_user.uid,
             "email": firebase_user.email,
             "token": custom_token.decode("utf-8"),
@@ -291,7 +259,6 @@ def login(user: AuthRequest):
     payload = {
         "email": user.email,
         "password": user.password,
-        "display_name": user.display_name,
         "returnSecureToken": True
     }
     response = requests.post(FIREBASE_LOGIN_URL, json=payload)
@@ -324,7 +291,7 @@ def login_user(data: TokenLogin):
 
 @app.get("/api/profile")
 async def profile(user=Depends(verify_firebase_token)):
-    return{
+    return {
         "uid": user["uid"],
         "email": user.get("email"),
         "provider": user.get("firebase", {}).get("sign_in_provider")
@@ -336,3 +303,6 @@ async def profile(user=Depends(verify_firebase_token)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+

@@ -82,7 +82,7 @@ class MacdStrategy(BaseStrategy):
         prev_macd = float(macd.iloc[-2])
         prev_signal = float(signal_line.iloc[-2])
         cur_macd = float(macd.iloc[-1])
-        cur_signal = float(signal.iloc[-1])
+        cur_signal = float(signal_line.iloc[-1])
 
         out: List[Signal] = []
 
