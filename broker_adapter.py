@@ -1,113 +1,269 @@
-import fxcmpy
-import pandas as pd
+import requests
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 import time
 
 
 # =========================
-# FXCM Adapter (LIVE TRADING)
+# Base Adapter
 # =========================
 
-class FxcmAdapter(BrokerAdapter):
-    """
-    FXCM REST API adapter using fxcmpy.
 
-    - symbol example for gold: 'XAU/USD'
-    """
+class BrokerAdapter(ABC):
+    """Base class defining the interface all brokers must implement."""
 
-    def __init__(self, access_token: str, log_level: str = "error", server: str = "demo"):
-        """
-        server: 'demo' or 'real'
-        """
-        super().__init__()
-        self.access_token = access_token
-        self.log_level = log_level
-        self.server = server
-        self.con: Optional[fxcmpy.fxcmpy] = None  # connection object
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+        self.connected = False
+
+    @abstractmethod
+    def connect(self) -> bool:
+        pass
+
+    @abstractmethod
+    def fetch_ticker(self, symbol: str) -> Dict:
+        pass
+
+    @abstractmethod
+    def fetch_ohlcv(self, symbol: str, interval: str, limit: int) -> List[List]:
+        pass
+
+    # Execution interface
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ):
+        raise NotImplementedError("Live trading not supported by this adapter")
+
+    def get_positions(self):
+        return []
+
+    def get_account_info(self):
+        return None
+
+
+# =========================
+# Twelve Data (Market Data)
+# =========================
+
+
+class TwelveDataAdapter(BrokerAdapter):
+    BASE_URL = "https://api.twelvedata.com"
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self.session = requests.Session()
+        self.session.params = {"apikey": self.api_key}
 
     def connect(self) -> bool:
         try:
-            self.con = fxcmpy.fxcmpy(
-                access_token=self.access_token,
-                log_level=self.log_level,
-                server=self.server,  # 'demo' or 'real'
+            response = self.session.get(
+                f"{self.BASE_URL}/quote", params={"symbol": "XAU/USD"}
             )
-            # simple sanity check: request account info
-            accounts = self.con.get_accounts()
-            if accounts is not None and len(accounts) > 0:
+            data = response.json()
+            if data.get("price") or data.get("close"):
                 self.connected = True
-                print("✓ Connected to FXCM via fxcmpy")
+                print("✓ Connected to Twelve Data API")
                 return True
-            print("✗ FXCM connection failed: no accounts returned")
+            print(f"✗ TwelveData connection failed: {data}")
             return False
         except Exception as e:
-            print(f"✗ FXCM connection error: {e}")
+            print(f"✗ Connection error: {e}")
             return False
 
-    def fetch_ticker(self, symbol: str = "XAU/USD") -> Dict:
-        """
-        Emulate a ticker via last bid/ask price from get_last_price.
-        """
-        if self.con is None:
-            raise Exception("FXCM not connected")
-        p = self.con.get_last_price(symbol)
-        # fxcmpy get_last_price returns an object with bid/ask fields. [web:23][web:31]
-        price = float(p.ask)
+    def fetch_ticker(self, symbol: str = "XAUUSD") -> Dict:
+        response = self.session.get(
+            f"{self.BASE_URL}/quote",
+            params={"symbol": symbol, "apikey": self.api_key},
+        )
+        data = response.json()
+        raw_price = data.get("price") or data.get("close")
+        if raw_price is None:
+            raise Exception(f"Invalid response: {data}")
         return {
-            "symbol": symbol.replace("/", ""),
-            "price": price,
+            "symbol": symbol,
+            "price": float(raw_price),
+            "change": float(data.get("change", 0)),
+            "change_percent": float(data.get("percent_change", 0)),
             "timestamp": int(time.time() * 1000),
         }
 
     def fetch_ohlcv(
-        self,
-        symbol: str = "XAU/USD",
-        interval: str = "H1",
-        limit: int = 100,
+        self, symbol: str = "XAU/USD", interval: str = "1h", limit: int = 100
     ) -> List[List]:
-        """
-        Map your interval string to FXCM time frame.
-        Example mappings:
-            '1m' -> 'm1'
-            '5m' -> 'm5'
-            '15m' -> 'm15'
-            '1h' -> 'H1'
-            '4h' -> 'H4'
-            '1d' -> 'D1'
-        """
-        if self.con is None:
-            raise Exception("FXCM not connected")
-
-        tf_map = {
-            "1m": "m1",
-            "5m": "m5",
-            "15m": "m15",
-            "30m": "m30",
-            "1h": "H1",
-            "4h": "H4",
-            "1d": "D1",
-        }
-        fxcm_tf = tf_map.get(interval, interval)  # allow raw pass-through
-
-        # fxcmpy exposes get_candles with columns bidopen, bidhigh, bidlow, bidclose, etc. [web:23][web:31]
-        df = self.con.get_candles(symbol, period=fxcm_tf, number=limit)
-        df = df.sort_index()  # oldest first
-
+        response = self.session.get(
+            f"{self.BASE_URL}/time_series",
+            params={"symbol": symbol, "interval": interval, "outputsize": limit},
+        )
+        data = response.json()
+        if "values" not in data:
+            raise Exception(f"API Error: {data}")
         ohlcv = []
-        for ts, row in df.iterrows():
-            # ts is a pandas Timestamp
-            timestamp = int(ts.timestamp() * 1000)
-            ohlcv.append([
-                timestamp,
-                float(row["bidopen"]),
-                float(row["bidhigh"]),
-                float(row["bidlow"]),
-                float(row["bidclose"]),
-                float(row.get("tickqty", 0.0)),  # or 0 if not available
-            ])
+        for candle in reversed(data["values"]):
+            timestamp = int(
+                time.mktime(
+                    time.strptime(candle["datetime"], "%Y-%m-%d %H:%M:%S")
+                )
+                * 1000
+            )
+            ohlcv.append(
+                [
+                    timestamp,
+                    float(candle["open"]),
+                    float(candle["high"]),
+                    float(candle["low"]),
+                    float(candle["close"]),
+                    0,
+                ]
+            )
         return ohlcv
 
+
+# =========================
+# Alpha Vantage (Market Data)
+# =========================
+
+
+class AlphaVantageAdapter(BrokerAdapter):
+    BASE_URL = "https://www.alphavantage.co/query"
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self.session = requests.Session()
+
+    def connect(self) -> bool:
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": "XAU",
+            "to_currency": "USD",
+            "apikey": self.api_key,
+        }
+        response = self.session.get(self.BASE_URL, params=params)
+        data = response.json()
+        if "Realtime Currency Exchange Rate" in data:
+            self.connected = True
+            print("✓ Connected to Alpha Vantage API")
+            return True
+        print(f"✗ AlphaVantage connection failed: {data}")
+        return False
+
+    def fetch_ticker(self, symbol: str = "XAUUSD") -> Dict:
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": "XAU",
+            "to_currency": "USD",
+            "apikey": self.api_key,
+        }
+        response = self.session.get(self.BASE_URL, params=params)
+        data = response.json()
+        rate = data.get("Realtime Currency Exchange Rate")
+        if not rate:
+            raise Exception(f"API Error: {data}")
+        return {
+            "symbol": symbol,
+            "price": float(rate["5. Exchange Rate"]),
+            "timestamp": int(time.time() * 1000),
+        }
+
+    def fetch_ohlcv(self, symbol: str, interval: str, limit: int) -> List[List]:
+        raise Exception("Alpha Vantage OHLCV too limited for trading")
+
+
+# =========================
+# Saxo Adapter (LIVE TRADING)
+# =========================
+
+
+class SaxoAdapter(BrokerAdapter):
+    """
+    Saxo Bank OpenAPI adapter.
+
+    You need:
+    - access_token: OAuth access token obtained via the /token endpoint.
+    - account_key: Saxo AccountKey for the account to trade on.
+    - uic_map: maps your symbol (e.g. 'XAUUSD') to Saxo Uic.
+    - asset_type_map: maps symbol to Saxo AssetType (e.g. 'CfdOnCommodity' or 'FxSpot').
+    """
+
+    BASE_URL = "https://gateway.saxo.com/openapi"
+
+    def __init__(
+        self,
+        access_token: str,
+        account_key: str,
+        uic_map: Dict[str, int],
+        asset_type_map: Dict[str, str],
+    ):
+        super().__init__()
+        self.access_token = access_token
+        self.account_key = account_key
+        self.uic_map = uic_map
+        self.asset_type_map = asset_type_map
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+            }
+        )
+
+    # --------------------------
+    # Connection / account check
+    # --------------------------
+    def connect(self) -> bool:
+        # Simple check: get current account(s) and ensure AccountKey is valid.
+        url = f"{self.BASE_URL}/port/v1/accounts/me"
+        r = self.session.get(url)
+        self.connected = r.status_code == 200
+        if self.connected:
+            print(f"✓ Connected to Saxo (AccountKey={self.account_key})")
+        else:
+            print(f"✗ Saxo connection failed: {r.status_code} {r.text}")
+        return self.connected
+
+    # --------------------------
+    # Ticker (snapshot price)
+    # --------------------------
+    def fetch_ticker(self, symbol: str) -> Dict:
+        """
+        Uses InfoPrices to get a snapshot price for the given symbol.[web:47][web:50][web:56]
+        """
+        uic = self.uic_map[symbol]
+        asset_type = self.asset_type_map[symbol]
+
+        url = f"{self.BASE_URL}/trade/v1/infoprices"
+        params = {"Uic": uic, "AssetType": asset_type}
+        r = self.session.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+        price_data = data["Data"][0]
+        bid = float(price_data["Quote"]["Bid"])
+        ask = float(price_data["Quote"]["Ask"])
+        mid = (bid + ask) / 2.0
+
+        return {
+            "symbol": symbol,
+            "price": mid,
+            "timestamp": int(time.time() * 1000),
+        }
+
+    # --------------------------
+    # OHLCV
+    # --------------------------
+    def fetch_ohlcv(self, symbol: str, interval: str, limit: int) -> List[List]:
+        # Keep using TwelveData or another market data broker for candles.
+        raise Exception("Use market data broker for candles")
+
+    # --------------------------
+    # Place order (market)
+    # --------------------------
     def place_order(
         self,
         symbol: str,
@@ -118,70 +274,71 @@ class FxcmAdapter(BrokerAdapter):
         take_profit: Optional[float] = None,
     ):
         """
-        Place a market order using fxcmpy.open_trade.
+        Places a market order using Saxo's Trade API.[web:47][web:49][web:58]
         """
-        if self.con is None:
-            raise Exception("FXCM not connected")
+        uic = self.uic_map[symbol]
+        asset_type = self.asset_type_map[symbol]
+        buy_sell = "Buy" if side.upper() == "BUY" else "Sell"
 
-        is_buy = True if side.upper() == "BUY" else False
-
-        # FXCM trade sizes are in contracts; check your account’s min/step size. [web:25][web:33]
-        kwargs = {
-            "symbol": symbol,
-            "is_buy": is_buy,
-            "amount": qty,
-            "time_in_force": "GTC",
-            "order_type": "AtMarket",
+        order_body = {
+            "AccountKey": self.account_key,
+            "Uic": uic,
+            "AssetType": asset_type,
+            "BuySell": buy_sell,
+            "Amount": qty,
+            "OrderType": "Market",
+            "OrderDuration": {"DurationType": "Day"},
         }
 
-        if stop_loss is not None:
-            kwargs["stop"] = stop_loss
-            kwargs["is_stop_in_pips"] = False
-        if take_profit is not None:
-            kwargs["limit"] = take_profit
-            kwargs["is_limit_in_pips"] = False
+        # Simple example of related orders for SL/TP.[web:46][web:52][web:58]
+        if stop_loss or take_profit:
+            order_body["OrderRelation"] = {"Orders": []}
+            opp_side = "Sell" if buy_sell == "Buy" else "Buy"
 
-        # fxcmpy.open_trade returns an fxcmpy_order object. [web:28][web:31]
-        order = self.con.open_trade(**kwargs)
-        # normalize to dict
-        return {
-            "order_id": order.get_orderId(),
-            "is_buy": is_buy,
-            "symbol": symbol,
-            "amount": qty,
-        }
+            if stop_loss:
+                order_body["OrderRelation"]["Orders"].append(
+                    {
+                        "OrderType": "Stop",
+                        "StopPrice": stop_loss,
+                        "BuySell": opp_side,
+                        "Amount": qty,
+                    }
+                )
 
+            if take_profit:
+                order_body["OrderRelation"]["Orders"].append(
+                    {
+                        "OrderType": "Limit",
+                        "Price": take_profit,
+                        "BuySell": opp_side,
+                        "Amount": qty,
+                    }
+                )
+
+        url = f"{self.BASE_URL}/trade/v2/orders"
+        r = self.session.post(url, json=order_body)
+        if r.status_code not in (200, 201):
+            raise Exception(f"Saxo order failed: {r.status_code} {r.text}")
+        return r.json()
+
+    # --------------------------
+    # Positions
+    # --------------------------
     def get_positions(self):
-        if self.con is None:
+        url = f"{self.BASE_URL}/port/v1/positions/me"
+        r = self.session.get(url)
+        if r.status_code != 200:
             return []
-        # fxcmpy.get_open_positions returns a DataFrame. [web:23][web:31]
-        df = self.con.get_open_positions()
-        if df is None or df.empty:
-            return []
-        positions = []
-        for _, row in df.iterrows():
-            positions.append({
-                "position_id": row.get("tradeId"),
-                "symbol": row.get("currency"),
-                "is_buy": bool(row.get("isBuy")),
-                "amount": float(row.get("amountK", 0.0)),
-                "open_price": float(row.get("open", 0.0)),
-                "pl": float(row.get("grossPL", 0.0)),
-            })
-        return positions
+        data = r.json()
+        return data.get("Data", [])
 
+    # --------------------------
+    # Account info
+    # --------------------------
     def get_account_info(self):
-        if self.con is None:
+        url = f"{self.BASE_URL}/port/v1/accounts/{self.account_key}"
+        r = self.session.get(url)
+        if r.status_code != 200:
             return None
-        df = self.con.get_accounts()  # DataFrame with account fields. [web:23]
-        if df is None or df.empty:
-            return None
-        row = df.iloc[0]
-        return {
-            "account_id": row.get("accountId"),
-            "balance": float(row.get("balance", 0.0)),
-            "equity": float(row.get("equity", 0.0)),
-            "margin": float(row.get("usableMargin", 0.0)),
-            "currency": row.get("currency"),
-        }
+        return r.json()
 
